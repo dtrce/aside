@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ASIDE_HOME="${ASIDE_HOME:-$HOME/.local/share/aside}"
+[[ "$ASIDE_HOME" == /* ]] || { printf 'error: ASIDE_HOME must be an absolute path\n' >&2; exit 1; }
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+canonical_dir() {
+  local dir="$1"
+  [[ -d "$dir" ]] || die "directory does not exist: $dir"
+  (cd "$dir" 2>/dev/null && pwd -P) || die "failed to resolve directory: $dir"
+}
+
+validate_component() {
+  local component="$1" reject_dash="${2:-0}"
+  [[ -n "$component" ]] || die "invalid path: empty path segment"
+  [[ "$component" != "." && "$component" != ".." ]] || die "invalid path: path traversal not allowed"
+  if [[ "$reject_dash" == "1" ]]; then
+    [[ "$component" != -* ]] || die "invalid path: cannot start with -"
+  fi
+}
+
+resolve_absolute_dir() {
+  local path="$1"
+  local current="/" component next
+  local -a parts
+
+  [[ "$path" == /* ]] || die "invalid path: absolute path required"
+  [[ "$path" != *"//"* ]] || die "invalid path: empty path segment"
+
+  if [[ "$path" == "/" ]]; then
+    printf '/\n'
+    return
+  fi
+
+  IFS='/' read -r -a parts <<< "${path#/}"
+  for component in "${parts[@]}"; do
+    validate_component "$component"
+    next="${current%/}/$component"
+    if [[ -e "$next" ]]; then
+      [[ -d "$next" ]] || die "invalid path: expected directory: $next"
+      current=$(canonical_dir "$next") || return 1
+    else
+      current="$next"
+    fi
+  done
+
+  printf '%s\n' "$current"
+}
+
+safe_dir() {
+  local base="$1" rel="$2" create="${3:-0}" reject_dash="${4:-0}"
+  local current="$base" component next
+  local -a parts
+
+  [[ "$rel" != /* ]] || die "invalid path: absolute paths not allowed"
+  [[ "$rel" != *"//"* ]] || die "invalid path: empty path segment"
+  [[ -n "$rel" ]] || {
+    printf '%s\n' "$current"
+    return
+  }
+
+  if [[ -e "$current" ]]; then
+    [[ -d "$current" ]] || die "invalid path: expected directory: $current"
+    current=$(canonical_dir "$current") || return 1
+  fi
+
+  IFS='/' read -r -a parts <<< "$rel"
+  for component in "${parts[@]}"; do
+    validate_component "$component" "$reject_dash"
+    next="$current/$component"
+    [[ ! -L "$next" ]] || die "invalid path: symlinked directories are not allowed"
+    if [[ -e "$next" ]]; then
+      [[ -d "$next" ]] || die "invalid path: expected directory: $next"
+      current=$(canonical_dir "$next") || return 1
+    elif [[ "$create" == "1" ]]; then
+      mkdir -- "$next"
+      current=$(canonical_dir "$next") || return 1
+    else
+      current="$next"
+    fi
+  done
+
+  printf '%s\n' "$current"
+}
+
+safe_target() {
+  local dir="$1" name="$2" create_parents="${3:-0}" allow_symlink_target="${4:-0}"
+  local parent='' leaf="$name" target
+
+  [[ -n "$name" ]] || die "invalid name: empty path"
+  [[ "$name" != /* ]] || die "invalid name: absolute paths not allowed"
+  [[ "$name" != *"//"* ]] || die "invalid name: empty path segment"
+
+  if [[ "$name" == */* ]]; then
+    parent="${name%/*}"
+    leaf="${name##*/}"
+    dir=$(safe_dir "$dir" "$parent" "$create_parents" 1) || return 1
+  fi
+
+  validate_component "$leaf" 1
+  target="$dir/$leaf"
+  if [[ -L "$target" && "$allow_symlink_target" != "1" ]]; then
+    die "invalid name: symlink targets are not allowed"
+  fi
+
+  printf '%s\n' "$target"
+}
+
+git_root() {
+  git rev-parse --show-toplevel 2>/dev/null || die "not in a git repository"
+}
+
+repo_id() {
+  local root="$1"
+  local remote
+  remote=$(git -C "$root" remote get-url origin 2>/dev/null || true)
+  if [[ -n "$remote" ]]; then
+    if [[ "$remote" == file://* ]]; then
+      remote="${remote#file://}"
+      echo "_file${remote//\//__}"
+      return
+    fi
+    if [[ "$remote" == /* ]]; then
+      echo "_file${remote//\//__}"
+      return
+    fi
+    remote="${remote%.git}"
+    remote="${remote#https://}"
+    remote="${remote#http://}"
+    remote="${remote#ssh://git@}"
+    remote="${remote#ssh://}"
+    remote="${remote#git@}"
+    remote="${remote/://}"
+    remote="${remote%/}"
+    [[ -n "$remote" ]] || die "unable to derive repo id from origin"
+    echo "$remote"
+  else
+    echo "_local${root//\//__}"
+  fi
+}
+
+aside_dir() {
+  local root store repo_root repo create="${1:-0}"
+  root=$(git_root) || return 1
+  repo_root=$(canonical_dir "$root") || return 1
+  store=$(resolve_absolute_dir "$ASIDE_HOME") || return 1
+  [[ "$store/" != "$repo_root/"* ]] || die "ASIDE_HOME must be outside the current repo"
+  if [[ -e "$store" ]]; then
+    [[ -d "$store" ]] || die "ASIDE_HOME must be a directory"
+  else
+    mkdir -p -- "$store"
+  fi
+  store=$(canonical_dir "$store") || return 1
+  repo=$(repo_id "$root") || return 1
+  safe_dir "$store" "$repo" "$create" 0
+}
+
+cmd_add() {
+  [[ $# -gt 0 ]] || die "usage: aside add <name>"
+  local dir
+  dir=$(aside_dir 1) || exit 1
+  for name in "$@"; do
+    local target
+    target=$(safe_target "$dir" "$name" 1 0) || exit 1
+    if [[ -e "$target" ]]; then
+      echo "already exists: $name"
+    else
+      touch -- "$target"
+      echo "created: $name"
+    fi
+  done
+}
+
+cmd_rm() {
+  [[ $# -gt 0 ]] || die "usage: aside rm <name>"
+  local dir
+  dir=$(aside_dir 0) || exit 1
+  for name in "$@"; do
+    local target
+    target=$(safe_target "$dir" "$name" 0 1) || exit 1
+    if [[ -e "$target" ]]; then
+      rm -rf -- "$target"
+      echo "removed: $name"
+    else
+      echo "not found: $name"
+    fi
+  done
+}
+
+cmd_ls() {
+  local dir
+  dir=$(aside_dir 0) || exit 1
+  if [[ ! -d "$dir" ]]; then
+    echo "no aside files for this repo"
+    return
+  fi
+  (cd "$dir" && find -P . -type f | sed 's|^\./||' | sort)
+}
+
+cmd_where() {
+  aside_dir 0
+}
+
+cmd_count() {
+  local dir
+  dir=$(aside_dir 0) || exit 1
+  if [[ ! -d "$dir" ]]; then
+    echo "0"
+    return
+  fi
+  find -P "$dir" -type f | wc -l | tr -d ' '
+}
+
+cmd_help() {
+  cat <<'HELP'
+aside — personal side files for git repos (alias: asd)
+
+Built-in:
+  add <name> ...      Create aside file(s)
+  rm <name> ...       Delete aside file(s)
+  ls                  List aside files for current repo
+  count               Count aside files for current repo
+  where               Print store path for current repo
+  help                Show this help
+
+Anything else is proxied:
+  aside cat notes.md
+  aside vi notes.md
+  asd bat notes.md
+  asd code notes.md
+
+Environment:
+  ASIDE_HOME          Store location (default: ~/.local/share/aside)
+HELP
+}
+
+# ── Main ──────────────────────────────────────────────────────────────
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+  add)    cmd_add "$@" ;;
+  rm)     cmd_rm "$@" ;;
+  ls)     cmd_ls "$@" ;;
+  count)  cmd_count "$@" ;;
+  where)  cmd_where "$@" ;;
+  help|--help|-h) cmd_help ;;
+  *)
+    dir=$(aside_dir 1) || exit 1
+    args=()
+    for arg in "$@"; do
+      target=$(safe_target "$dir" "$arg" 1 0) || exit 1
+      args+=("$target")
+    done
+    exec "$cmd" "${args[@]}"
+    ;;
+esac
